@@ -20,6 +20,8 @@ p = argparse.ArgumentParser()
 p.add_argument("--ckpt", default=os.path.join(CKPT_DIR, "best.pt"))
 p.add_argument("--val", action="store_true")
 p.add_argument("--thr", type=float, default=0.5)
+p.add_argument("--min-vox", type=int, default=2000,
+               help="drop 3D connected components smaller than this per organ per scan (0 = off)")
 p.add_argument("--out", default=os.path.join(ROOT, "submission.csv"))
 args = p.parse_args()
 dev = torch.device("cuda")
@@ -71,11 +73,29 @@ if args.val:
 else:
     test = pd.read_csv(os.path.join(DATA, "test.csv"))
     recs = index_slices("test")
-    preds = {}
-    for r, pr in predict_volumes(recs):
-        b = (pr > args.thr).cpu().numpy().astype(np.uint8)
+    from postproc import drop_small_3d
+    preds, buf, removed = {}, [], 0
+
+    def flush():
+        global removed
+        if not buf:
+            return
+        vol = np.stack([b for _, b in buf])  # (n, 3, h, w) bool
         for k, c in enumerate(CLASSES):
-            preds[(r["id"], c)] = rle_encode(b[k]) if b[k].any() else ""
+            m = vol[:, k]
+            if args.min_vox:
+                m, n = drop_small_3d(m, args.min_vox)
+                removed += n
+            for (r, _), mk in zip(buf, m):
+                preds[(r["id"], c)] = rle_encode(mk.astype(np.uint8)) if mk.any() else ""
+        buf.clear()
+
+    for r, pr in predict_volumes(recs):
+        if buf and buf[-1][0]["vol"] != r["vol"]:
+            flush()
+        buf.append((r, (pr > args.thr).cpu().numpy()))
+    flush()
+    print(f"3D cleanup (min {args.min_vox} voxels) removed {removed} components")
     missing = [k for k in zip(test.id, test["class"]) if k not in preds]
     assert not missing, f"{len(missing)} test rows have no image, e.g. {missing[:3]}"
     test["predicted"] = [preds[k] for k in zip(test.id, test["class"])]
